@@ -3,314 +3,322 @@ import html
 import json
 import os
 import re
+import unicodedata
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
 
 DATA_FILE = Path("Plumbing Google Maps_KH.csv")
 OUTPUT_DIR = Path("docs")
+STORES_DIR = OUTPUT_DIR / "stores"
 ASSETS_DIR = OUTPUT_DIR / "assets"
-SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "https://example.com/plumbing")
+
+DEFAULT_BASE_URL = "https://<your-github-username>.github.io/plumbing/"
+ENCODING = "cp950"
 
 
-def slugify(name: str, index: int, seen: set) -> str:
-    base = re.sub(r"[^\w]+", "-", name).strip("-")
-    base = re.sub(r"-+", "-", base)
-    ascii_base = base.encode("ascii", "ignore").decode()
-    ascii_base = ascii_base.strip("-")
-    if not ascii_base or not re.search(r"[a-zA-Z0-9]", ascii_base):
-        ascii_base = f"store-{index + 1}"
-    candidate = ascii_base.lower()
+def slugify(name: str, existing: set[str]) -> str:
+    normalized = unicodedata.normalize("NFKC", name).strip()
+    candidate = re.sub(r"[\s・／/、]+", "-", normalized)
+    candidate = re.sub(r"[^\w一-龥-]", "", candidate)
+    candidate = re.sub(r"-+", "-", candidate).strip("-") or "store"
+    # Keep slugs file-system friendly
+    candidate = candidate[:80]
+
+    slug = candidate
     suffix = 1
-    while candidate in seen:
+    while slug in existing:
         suffix += 1
-        candidate = f"{ascii_base.lower()}-{suffix}"
-    seen.add(candidate)
-    return candidate
+        slug = f"{candidate}-{suffix}"
+    existing.add(slug)
+    return slug
 
 
-def load_stores() -> List[Dict[str, str]]:
-    stores: List[Dict[str, str]] = []
-    with DATA_FILE.open(encoding="big5") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for idx, row in enumerate(reader):
-            stores.append({k: (v or "").strip() for k, v in row.items()})
-    return stores
+def load_rows() -> list[dict[str, str]]:
+    with DATA_FILE.open(encoding=ENCODING, newline="") as f:
+        reader = csv.DictReader(f)
+        return [row for row in reader]
 
 
-def ensure_output_dirs() -> None:
+def ensure_dirs():
+    STORES_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def build_page_head(title: str, description: str, url: str, keywords: List[str]) -> str:
-    keywords_str = ", ".join(filter(None, keywords))
-    head_parts = [
-        "    <meta charset=\"utf-8\">",
-        "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-        f"    <title>{html.escape(title)}</title>",
-        f"    <meta name=\"description\" content=\"{html.escape(description)}\">",
-    ]
-    if keywords_str:
-        head_parts.append(f"    <meta name=\"keywords\" content=\"{html.escape(keywords_str)}\">")
-    if url:
-        head_parts.extend([
-            f"    <link rel=\"canonical\" href=\"{html.escape(url)}\">",
-            f"    <meta property=\"og:url\" content=\"{html.escape(url)}\">",
-        ])
-    head_parts.extend([
-        f"    <meta property=\"og:title\" content=\"{html.escape(title)}\">",
-        f"    <meta property=\"og:description\" content=\"{html.escape(description)}\">",
-        "    <meta property=\"og:type\" content=\"website\">",
-        "    <meta property=\"og:locale\" content=\"zh_TW\">",
-        "    <meta property=\"og:site_name\" content=\"高雄水電行專頁\">",
-        "    <meta name=\"twitter:card\" content=\"summary\">",
-        "    <link rel=\"stylesheet\" href=\"assets/style.css\">",
-    ])
-    return "\n".join(head_parts)
+def build_meta_description(store: dict[str, str]) -> str:
+    pieces = [store.get("店家名稱", "").strip()]
+    if store.get("評分"):
+        pieces.append(f"評分 {store['評分']}")
+    if store.get("店家類型"):
+        pieces.append(store["店家類型"].strip())
+    if store.get("地址"):
+        pieces.append(store["地址"].strip())
+    if store.get("電話"):
+        pieces.append(f"電話 {store['電話'].strip()}")
+    return " · ".join(p for p in pieces if p)
 
 
-def render_index(stores: List[Dict[str, str]]) -> str:
-    title = "高雄水電行目錄"
-    description = "為高雄市水電行打造的獨立網站集合，包含地址、電話與營業資訊。"
-    url = f"{SITE_BASE_URL.rstrip('/')}/"
-    head = build_page_head(title, description, url, ["高雄水電行", "水電師傅", "水電維修", "電機服務"])
+def seo_head(title: str, description: str, url: str, asset_prefix: str, extra_meta: str = "") -> str:
+    escaped_title = html.escape(title)
+    escaped_description = html.escape(description)
+    escaped_url = html.escape(url)
+    css_path = f"{asset_prefix}style.css"
+    return f"""
+    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n    <title>{escaped_title}</title>\n    <meta name=\"description\" content=\"{escaped_description}\">\n    <meta property=\"og:title\" content=\"{escaped_title}\">\n    <meta property=\"og:description\" content=\"{escaped_description}\">\n    <meta property=\"og:type\" content=\"website\">\n    <meta property=\"og:url\" content=\"{escaped_url}\">\n    <link rel=\"canonical\" href=\"{escaped_url}\">\n    <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n    <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n    <link href=\"https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;600;700&display=swap\" rel=\"stylesheet\">\n    <link rel=\"stylesheet\" href=\"{css_path}\">\n    {extra_meta}\n    """
+
+
+def render_store_page(store: dict[str, str], slug: str, base_url: str) -> str:
+    title = f"{store['店家名稱']}｜高雄水電行"
+    description = build_meta_description(store)
+    url = f"{base_url.rstrip('/')}/stores/{slug}.html"
+    structured_data = {
+        "@context": "https://schema.org",
+        "@type": "Store",
+        "name": store.get("店家名稱"),
+        "url": url,
+        "image": store.get("Google 地圖連結", ""),
+        "address": store.get("地址"),
+        "telephone": store.get("電話") or None,
+        "aggregateRating": {
+            "@type": "AggregateRating",
+            "ratingValue": store.get("評分") or None,
+            "reviewCount": store.get("評分") and 1 or None,
+        },
+        "sameAs": [value for value in [store.get("網站"), store.get("Google 地圖連結")] if value],
+    }
+    json_ld = json.dumps(structured_data, ensure_ascii=False, indent=2)
+
+    def render_item(label: str, value: str) -> str:
+        if not value:
+            return ""
+        display = html.escape(value)
+        if isinstance(value, str) and value.startswith("http"):
+            display = f'<a href="{html.escape(value)}" target="_blank" rel="noopener">{display}</a>'
+        return f'<div class="detail-row"><span class="label">{html.escape(label)}</span><span>{display}</span></div>'
+
+    website_link = store.get("網站") or store.get("Google 地圖連結")
+    services = [v for v in [store.get("實體和線上"), store.get("其他服務")] if v]
+    services_html = "".join(
+        f"<span class=\"chip\">{html.escape(s)}</span>" for s in services
+    ) or "<span class=\"chip muted\">尚未提供服務資訊</span>"
+
+    return f"""
+<!doctype html>
+<html lang=\"zh-Hant\">
+<head>
+{seo_head(title, description, url, asset_prefix='../assets/', extra_meta=f'<script type="application/ld+json">{json_ld}</script>')}
+</head>
+<body>
+<header class=\"site-header\">
+  <div class=\"container\">
+    <a href=\"../index.html\" class=\"logo\">高雄水電行導覽</a>
+    <nav><a href=\"../index.html#list\">全部店家</a><a href=\"../index.html#faq\">常見問題</a></nav>
+  </div>
+</header>
+<main class=\"container\">
+  <section class=\"hero\">
+    <p class=\"eyebrow\">高雄在地水電服務</p>
+    <h1>{html.escape(store['店家名稱'])}</h1>
+    <p class=\"lede\">{html.escape(description)}</p>
+    <div class=\"cta-group\">
+      <a class=\"button primary\" href=\"{html.escape(store.get('Google 地圖連結', '#'))}\" target=\"_blank\" rel=\"noopener\">查看地圖</a>
+      <a class=\"button secondary\" href=\"../index.html\">返回店家列表</a>
+    </div>
+  </section>
+
+  <section class=\"card-grid\">
+    <div class=\"card\">
+      <h2>基本資料</h2>
+      {render_item('店家類型', store.get('店家類型', ''))}
+      {render_item('評分', store.get('評分', ''))}
+      {render_item('地址', store.get('地址', ''))}
+      {render_item('打烊時間', store.get('打烊時間', ''))}
+      {render_item('電話', store.get('電話', ''))}
+    </div>
+    <div class=\"card\">
+      <h2>服務特色</h2>
+      <div class=\"chips\">{services_html}</div>
+      {render_item('網站', website_link)}
+      {render_item('Google 地圖', store.get('Google 地圖連結', ''))}
+    </div>
+  </section>
+
+  <section id=\"faq\" class=\"faq\">
+    <div>
+      <h2>快速問答</h2>
+      <details open>
+        <summary>如何聯絡 {html.escape(store['店家名稱'])}？</summary>
+        <p>可撥打 {html.escape(store.get('電話', '')) or '店家未提供電話'}，或透過 Google 地圖頁面洽詢。</p>
+      </details>
+      <details>
+        <summary>有提供哪些服務？</summary>
+        <p>{'、'.join(html.escape(s) for s in services) if services else '尚未提供服務資訊'}</p>
+      </details>
+      <details>
+        <summary>是否支援線上預約？</summary>
+        <p>若店家提供「線上估價服務」或「門市服務」標記，即可事先詢價或預約。</p>
+      </details>
+    </div>
+  </section>
+</main>
+<footer class=\"site-footer\">
+  <div class=\"container\">
+    <p>高雄水電行資料導覽｜自動化產生的在地服務索引。</p>
+  </div>
+</footer>
+<script src=\"../assets/script.js\"></script>
+</body>
+</html>
+"""
+
+
+def render_index(stores: list[dict[str, str]], slug_map: dict[str, str], base_url: str) -> str:
+    title = "高雄水電行地圖與聯絡資訊"
+    description = "瀏覽高雄各區水電行、工程行與水匠的地址、評分、營業時間與聯絡方式，快速找到附近的水電服務。"
+    url = f"{base_url.rstrip('/')}/index.html"
+    structured_data = {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": title,
+        "url": url,
+        "potentialAction": {
+            "@type": "SearchAction",
+            "target": f"{url}?q={{search_term}}",
+            "query-input": "required name=search_term",
+        },
+    }
+    json_ld = json.dumps(structured_data, ensure_ascii=False, indent=2)
+
     cards = []
     for store in stores:
+        slug = slug_map[store['店家名稱']]
+        services = "、".join(filter(None, [store.get("實體和線上"), store.get("其他服務")]))
+        meta = build_meta_description(store)
         cards.append(
-            f"      <article class=\"card\">\n"
-            f"        <h2><a href=\"{store['slug']}.html\">{html.escape(store['店家名稱'])}</a></h2>\n"
-            f"        <p class=\"type\">{html.escape(store['店家類型'])}</p>\n"
-            f"        <p>評分：{html.escape(store['評分'] or '尚無評價')}</p>\n"
-            f"        <p>地址：{html.escape(store['地址'])}</p>\n"
-            f"        <p>電話：<a href=\"tel:{html.escape(store['電話']).replace(' ', '')}\">{html.escape(store['電話'])}</a></p>\n"
-            f"        <p>營業資訊：{html.escape(store['打烊時間'])}</p>\n"
-            "      </article>"
+            f"<article class=\"store-card\" data-name=\"{html.escape(store['店家名稱'])}\" data-type=\"{html.escape(store.get('店家類型',''))}\" data-address=\"{html.escape(store.get('地址',''))}\">"
+            f"<div class=\"card-header\"><p class=\"eyebrow\">{html.escape(store.get('店家類型','商店'))}</p><span class=\"rating\">⭐ {html.escape(store.get('評分','-'))}</span></div>"
+            f"<h2><a href=\"./stores/{slug}.html\">{html.escape(store['店家名稱'])}</a></h2>"
+            f"<p class=\"meta\">{html.escape(meta)}</p>"
+            f"<p class=\"services\">{html.escape(services) if services else '服務資訊待補'}</p>"
+            f"<div class=\"card-actions\"><a class=\"button primary\" href=\"./stores/{slug}.html\">查看細節</a>"
+            f"<a class=\"button ghost\" href=\"{html.escape(store.get('Google 地圖連結', '#'))}\" target=\"_blank\" rel=\"noopener\">開啟地圖</a></div>"
+            f"</article>"
         )
     cards_html = "\n".join(cards)
-    return f"""<!doctype html>
+
+    return f"""
+<!doctype html>
 <html lang=\"zh-Hant\">
-  <head>
-{head}
-  </head>
-  <body>
-    <header class=\"hero\">
-      <div class=\"container\">
-        <p class=\"eyebrow\">高雄專區</p>
-        <h1>{html.escape(title)}</h1>
-        <p>{html.escape(description)}</p>
+<head>
+{seo_head(title, description, url, asset_prefix='./assets/', extra_meta=f'<script type="application/ld+json">{json_ld}</script>')}
+</head>
+<body>
+<header class=\"site-header\">
+  <div class=\"container\">
+    <a href=\"./index.html\" class=\"logo\">高雄水電行導覽</a>
+    <nav><a href=\"#list\">店家列表</a><a href=\"#faq\">常見問題</a></nav>
+  </div>
+</header>
+<main class=\"container\">
+  <section class=\"hero\">
+    <p class=\"eyebrow\">GitHub Pages 靜態網站</p>
+    <h1>高雄水電行資訊大全</h1>
+    <p class=\"lede\">彙整高雄市 96 家水電行與工程行，包含地址、營業時間、評分、電話與地圖連結，方便搜尋附近的專業服務。</p>
+    <div class=\"cta-group\">
+      <a class=\"button primary\" href=\"#list\">瀏覽全部店家</a>
+      <a class=\"button secondary\" href=\"https://www.google.com/maps/search/%E9%AB%98%E9%9B%84+%E6%B0%B4%E9%9B%BB%E8%A1%8C\" target=\"_blank\" rel=\"noopener\">在地圖查看</a>
+    </div>
+  </section>
+
+  <section id=\"list\" class=\"list\">
+    <div class=\"list-header\">
+      <div>
+        <p class=\"eyebrow\">店家列表</p>
+        <h2>高雄 96 家水電行</h2>
       </div>
-    </header>
-    <main class=\"container\">
-      <section class=\"grid\">
-{cards_html}
-      </section>
-    </main>
-    <footer class=\"footer\">
-      <div class=\"container\">
-        <p>本頁面為高雄市水電行索引。歡迎來電預約，優先找到離您最近的水電師傅。</p>
+      <div class=\"filters\">
+        <input id=\"search\" type=\"search\" placeholder=\"輸入店名、地址或類型搜尋\" aria-label=\"搜尋店家\">
+        <select id=\"type-filter\" aria-label=\"類型篩選\">
+          <option value=\"\">全部類型</option>
+          <option value=\"水電行\">水電行</option>
+          <option value=\"水電承辦商\">水電承辦商</option>
+          <option value=\"水匠\">水匠</option>
+          <option value=\"商店\">商店</option>
+        </select>
       </div>
-    </footer>
-  </body>
+    </div>
+    <div class=\"grid\" id=\"store-grid\">
+      {cards_html}
+    </div>
+  </section>
+
+  <section id=\"faq\" class=\"faq\">
+    <div>
+      <h2>常見問題</h2>
+      <details open>
+        <summary>這些資料是否都在高雄？</summary>
+        <p>資料來源於 Google 地圖，高雄地區共收錄 96 家水電行與工程行。</p>
+      </details>
+      <details>
+        <summary>如何提升各店家的 SEO？</summary>
+        <p>每個店家頁面均包含語意化 HTML 標題、描述、Open Graph 標籤與 Schema.org LocalBusiness JSON-LD，有助於搜尋結果呈現。</p>
+      </details>
+      <details>
+        <summary>網站如何部署？</summary>
+        <p>將 docs/ 設定為 GitHub Pages 來源，即可自動呈現靜態網站。</p>
+      </details>
+    </div>
+  </section>
+</main>
+<footer class=\"site-footer\">
+  <div class=\"container\">
+    <p>高雄水電行資料導覽｜GitHub Pages 靜態網站。</p>
+  </div>
+</footer>
+<script src=\"./assets/script.js\"></script>
+</body>
 </html>
 """
 
 
-def render_store_page(store: Dict[str, str]) -> str:
-    title = f"{store['店家名稱']}｜高雄水電行"
-    description = f"{store['店家名稱']} 提供 {store['店家類型']} 服務，位於 {store['地址']}，電話 {store['電話']}，營業資訊：{store['打烊時間']}。"
-    url = f"{SITE_BASE_URL.rstrip('/')}/{store['slug']}.html"
-    keywords = [store["店家名稱"], "高雄水電", store["店家類型"], store["地址"].split("號")[0]]
-    head = build_page_head(title, description, url, keywords)
-
-    services = [s for s in [store.get("實體和線上"), store.get("其他服務")] if s]
-    website_section = ""
-    if store.get("網站"):
-        website_section = (
-            "      <p>官方網站：" f"<a href=\"{html.escape(store['網站'])}\" rel=\"noopener noreferrer\">{html.escape(store['網站'])}</a></p>\n"
-        )
-
-    schema = {
-        "@context": "https://schema.org",
-        "@type": "LocalBusiness",
-        "@id": url,
-        "name": store["店家名稱"],
-        "description": description,
-        "address": store.get("地址"),
-        "telephone": store.get("電話"),
-        "url": url,
-        "sameAs": [store.get("Google 地圖連結")],
-    }
-    if store.get("評分"):
-        try:
-            rating = float(store["評分"])
-            schema["aggregateRating"] = {
-                "@type": "AggregateRating",
-                "ratingValue": rating,
-                "reviewCount": max(1, int(rating)),
-            }
-        except ValueError:
-            pass
-    if services:
-        schema["knowsAbout"] = services
-
-    services_html = ""
-    if services:
-        services_html = (
-            "      <h3>服務特色</h3>\n" + "\n".join(f"      <p>• {html.escape(service)}</p>" for service in services)
-        )
-
-    return f"""<!doctype html>
-<html lang=\"zh-Hant\">
-  <head>
-{head}
-    <script type=\"application/ld+json\">{json.dumps(schema, ensure_ascii=False)}</script>
-  </head>
-  <body>
-    <header class=\"hero\">
-      <div class=\"container\">
-        <p class=\"eyebrow\">高雄水電行</p>
-        <h1>{html.escape(store['店家名稱'])}</h1>
-        <p class=\"type\">{html.escape(store['店家類型'])}</p>
-      </div>
-    </header>
-    <main class=\"container\">
-      <section class=\"content\">
-        <p class=\"highlight\">評分：{html.escape(store['評分'] or '尚無評價')}</p>
-        <p>地址：{html.escape(store['地址'])}</p>
-        <p>電話：<a href=\"tel:{html.escape(store['電話']).replace(' ', '')}\">{html.escape(store['電話'])}</a></p>
-        <p>營業資訊：{html.escape(store['打烊時間'])}</p>
-        <p>Google 地圖：<a href=\"{html.escape(store['Google 地圖連結'])}\" rel=\"noopener noreferrer\">查看路線</a></p>
-{website_section}        {services_html if services_html else ''}
-        <p><a class=\"back\" href=\"index.html\">← 回到所有水電行</a></p>
-      </section>
-    </main>
-    <footer class=\"footer\">
-      <div class=\"container\">
-        <p>本頁面收錄高雄水電行資訊，協助您快速找到合適的師傅。</p>
-      </div>
-    </footer>
-  </body>
-</html>
+def build_sitemap(store_slugs: dict[str, str], base_url: str) -> str:
+    base = base_url.rstrip("/")
+    urls = [f"{base}/index.html"] + [f"{base}/stores/{slug}.html" for slug in store_slugs.values()]
+    now = datetime.utcnow().strftime("%Y-%m-%d")
+    entries = "\n".join(
+        f"  <url><loc>{html.escape(u)}</loc><lastmod>{now}</lastmod></url>" for u in urls
+    )
+    return f"""
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">
+{entries}
+</urlset>
 """
 
 
-def write_file(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
+def main():
+    base_url = os.environ.get("BASE_URL", DEFAULT_BASE_URL)
+    rows = load_rows()
+    ensure_dirs()
 
+    slug_map: dict[str, str] = {}
+    existing_slugs: set[str] = set()
+    for row in rows:
+        name = row.get("店家名稱", "")
+        slug_map[name] = slugify(name, existing_slugs)
 
-def build_sitemap(slugs: List[str]) -> str:
-    base = SITE_BASE_URL.rstrip("/")
-    urls = [f"  <url>\n    <loc>{base}/</loc>\n  </url>"]
-    urls.extend(
-        f"  <url>\n    <loc>{base}/{html.escape(slug)}.html</loc>\n  </url>" for slug in slugs
-    )
-    return "\n".join(
-        ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">", *urls, "</urlset>"]
-    )
+    index_html = render_index(rows, slug_map, base_url)
+    (OUTPUT_DIR / "index.html").write_text(index_html, encoding="utf-8")
 
+    for row in rows:
+        slug = slug_map[row["店家名稱"]]
+        page = render_store_page(row, slug, base_url)
+        (STORES_DIR / f"{slug}.html").write_text(page, encoding="utf-8")
 
-def main() -> None:
-    ensure_output_dirs()
-    stores = load_stores()
-    slug_seen: set = set()
-    for idx, store in enumerate(stores):
-        store_slug = slugify(store["店家名稱"], idx, slug_seen)
-        store["slug"] = store_slug
-    index_html = render_index(stores)
-    write_file(OUTPUT_DIR / "index.html", index_html)
+    sitemap = build_sitemap(slug_map, base_url)
+    (OUTPUT_DIR / "sitemap.xml").write_text(sitemap, encoding="utf-8")
+    (OUTPUT_DIR / "robots.txt").write_text("Sitemap: " + base_url.rstrip("/") + "/sitemap.xml\n", encoding="utf-8")
 
-    for store in stores:
-        page_html = render_store_page(store)
-        write_file(OUTPUT_DIR / f"{store['slug']}.html", page_html)
-
-    sitemap = build_sitemap([store["slug"] for store in stores])
-    write_file(OUTPUT_DIR / "sitemap.xml", sitemap)
-    write_file(OUTPUT_DIR / "robots.txt", "Sitemap: {base}/sitemap.xml\n".format(base=SITE_BASE_URL.rstrip("/")))
-
-    style = """:root {
-  color-scheme: light;
-  --bg: #f7f7f7;
-  --text: #1c1c1e;
-  --muted: #4b5563;
-  --accent: #0ea5e9;
-  --card: #ffffff;
-  --border: #e5e7eb;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font-family: 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
-}
-.container {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 0 1.25rem 2rem;
-}
-.hero {
-  background: linear-gradient(135deg, #0ea5e9, #22d3ee);
-  color: white;
-  padding: 2.5rem 0 2rem;
-}
-.hero h1 { margin: 0.2rem 0 0.4rem; }
-.eyebrow {
-  letter-spacing: 0.1em;
-  font-size: 0.85rem;
-  text-transform: uppercase;
-  opacity: 0.9;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1rem;
-  margin-top: 1.5rem;
-}
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 1.2rem;
-  box-shadow: 0 6px 18px rgba(0,0,0,0.06);
-}
-.card h2 {
-  margin-top: 0;
-  margin-bottom: 0.35rem;
-}
-.card .type { color: var(--muted); margin: 0 0 0.4rem; }
-.card a { color: var(--accent); text-decoration: none; }
-.card a:hover { text-decoration: underline; }
-.content {
-  background: var(--card);
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  margin-top: -2rem;
-  padding: 1.5rem;
-  box-shadow: 0 10px 24px rgba(0,0,0,0.08);
-}
-.highlight {
-  display: inline-block;
-  padding: 0.25rem 0.75rem;
-  background: #ecfeff;
-  color: #0ea5e9;
-  border-radius: 999px;
-  font-weight: 600;
-}
-.footer {
-  background: #0f172a;
-  color: #e5e7eb;
-  padding: 1.5rem 0;
-  margin-top: 2rem;
-}
-.footer a { color: #e0f2fe; }
-.back { display: inline-block; margin-top: 1rem; color: var(--accent); }
-a { word-break: break-all; }
-@media (max-width: 640px) {
-  .hero { padding: 2rem 0 1.5rem; }
-  .content { margin-top: -1.5rem; }
-}
-"""
-    write_file(ASSETS_DIR / "style.css", style)
+    print(f"Generated {len(rows)} store pages.")
 
 
 if __name__ == "__main__":

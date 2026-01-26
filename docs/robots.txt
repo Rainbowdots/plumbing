@@ -1,1 +1,1 @@
-Sitemap: https://example.com/plumbing/sitemap.xml
+Sitemap: https://<your-github-username>.github.io/plumbing/sitemap.xml
